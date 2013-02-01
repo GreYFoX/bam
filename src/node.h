@@ -29,11 +29,23 @@ struct SCANNER
 	int (*scannerfunc)(struct NODE *, struct SCANNER *info);
 };
 
-#if 0
 struct JOB
 {
 	struct GRAPH *graph; /* graph that the job belongs to */
+
+	struct JOB *next; /* next job in the global joblist. head is stored in the graph */
+
+	struct NODELINK *firstoutput;
+
+	struct NODELINK *firstjobdep; /* list of job dependencies */
+	struct NODETREELINK *jobdeproot; /* tree of job dependencies */
 	
+	struct NODELINK *constraint_exclusive; /* list of exclusive constraints */
+	struct NODELINK *constraint_shared; /* list of shared constraints */
+
+	unsigned constraint_exclusive_count; /* */
+	unsigned constraint_shared_count; /* */
+
 	char *cmdline;
 	char *label;
 	char *filter;
@@ -41,13 +53,13 @@ struct JOB
 	hash_t cmdhash; /* hash of the command line for detecting changes */
 	hash_t cachehash; /* hash that should be written to the cache */
 
-	struct NODELINK *firstoutput;
-	
-	struct NODELINK *constraint_exclusive; /* list of exclusive constraints */
-	struct NODELINK *constraint_shared; /* list of shared constraints */
-	
+	unsigned priority; /* the priority is the priority of all jobs dependent on this job */
+
+	unsigned real:1; /* set if this isn't a nulljob */
+	unsigned counted:1; /* set if we have counted this job towards the number of targets to build */
+
+	volatile unsigned status; /* build status of the job, JOBSTATUS_* flags */
 };
-#endif
 
 /*
 	a node in the dependency graph
@@ -64,27 +76,14 @@ struct NODE
 	
 	struct NODELINK *firstdep; /* list of dependencies */
 	struct NODETREELINK *deproot; /* tree of dependencies */
-	
-	struct NODELINK *firstjobdep; /* list of job dependencies */
-	struct NODETREELINK *jobdeproot; /* tree of job dependencies */
+
+	struct NODE * volatile nextstat; /* next node to stat, written by main-thread, read by stat-thread*/
 
 	struct NODELINK *constraint_exclusive; /* list of exclusive constraints */
 	struct NODELINK *constraint_shared; /* list of shared constraints */
 	
-	char *filename; /* this contains the filename with the FULLPATH */
-	
-	/* either none of these are set or both of em are */
-	char *cmdline; /* command line that should be executed to build this node */
-	char *label; /* what to print when we build this node */
-	
-	char *filter; /* filter string, first character sets the type of filter */
-	
-	/* filename and the tool to build the resource */
-	unsigned cmdhash; /* hash of the command line for detecting changes */
-	unsigned cachehash; /* hash that should be written to the cache */
-	 
-	unsigned constraint_exclusive_count; /* */
-	unsigned constraint_shared_count; /* */
+	struct JOB *job; /* job that produces this node */
+	const char *filename; /* this contains the filename with the FULLPATH */
 
 	hash_t hashid; /* hash of the filename/nodename */
 	
@@ -95,17 +94,12 @@ struct NODE
 	unsigned id; /* used when doing traversal with marking (bitarray) */
 	
 	unsigned short filename_len; /* length of filename including zero term */
-	unsigned short depth;	/* depth in the graph. used for priority when buliding */
 	
 	/* various flags (4 bytes in the end) */
 	unsigned dirty:8; /* non-zero if the node has to be rebuilt */
 	unsigned depchecked:1; /* set if a dependency checker have processed the file */
-	unsigned counted:1; /* set if we have counted this node towards the number of targets to build */
 	unsigned targeted:1; /* set if this node is targeted for a build */
-	unsigned touch:1; /* when built, touch the output file as well */
 	unsigned cached:1; /* set if the node should be considered as cached */
-	
-	volatile unsigned workstatus:2; /* build status of the node, NODESTATUS_* flags */
 };
 
 /* cache node */
@@ -132,22 +126,36 @@ struct GRAPH
 	struct NODE *first;
 	struct NODE *last;
 
+	/* jobs */
+	struct JOB *firstjob;
+
+	/* file stating */
+	void *statthread;
+	struct NODE * volatile firststatnode; /* first node that we should stat, written by main-thread, read by stat-thread */
+	struct NODE * volatile finalstatnode; /* the very last node that we should stat, written by main-thread, read by stat-thread */
+	struct NODE *laststatnode; /* last node stats to, only read and written by the main-thread */
+
 	/* memory */
 	struct HEAP *heap;
 
 	/* needed when saving the cache */
 	int num_nodes;
+	int num_jobs; /* only real jobs */
 	int num_deps;
 };
 
 struct HEAP;
 struct CONTEXT;
 
-/* node status */
-#define NODESTATUS_UNDONE 0   /* node needs build */
-#define NODESTATUS_WORKING 1  /* a thread is working on this node */
-#define NODESTATUS_DONE 2     /* node built successfully */
-#define NODESTATUS_BROKEN 3   /* node tool reported an error or a dependency is broken */
+/* job status */
+#define JOBSTATUS_UNDONE 0   /* node needs build */
+#define JOBSTATUS_WORKING 1  /* a thread is working on this node */
+#define JOBSTATUS_DONE 2     /* node built successfully */
+#define JOBSTATUS_BROKEN 3   /* node tool reported an error or a dependency is broken */
+
+/* special defines */
+#define TIMESTAMP_NONE		-1
+#define TIMESTAMP_PSEUDO	1
 
 /* node creation error codes */
 #define NODECREATE_OK 0
@@ -173,23 +181,31 @@ struct CONTEXT;
 #define NODEDIRTY_DEPDIRTY 3    /* one of the dependencies is dirty */
 #define NODEDIRTY_DEPNEWER 4    /* one of the dependencies is newer */
 #define NODEDIRTY_GLOBALSTAMP 5 /* the globaltimestamp is newer */
+#define NODEDIRTY_FORCED 6 		/* forced dirty */
 
 /* you destroy graphs by destroying the heap */
-struct GRAPH *node_create_graph(struct HEAP *heap);
+struct GRAPH *node_graph_create(struct HEAP *heap);
+void node_graph_start_statthread(struct GRAPH *graph);
+void node_graph_end_statthread(struct GRAPH *graph);
+
+/* node jobs */
+struct JOB *node_job_create_null(struct GRAPH *graph);
+struct JOB *node_job_create(struct GRAPH *graph, const char *label, const char *cmdline);
+struct NODE *node_job_add_dependency(struct NODE *node, struct NODE *depnode);
 
 /* */
-int node_create(struct NODE **node, struct GRAPH *graph, const char *filename, const char *label, const char *cmdline);
+int node_create(struct NODE **node, struct GRAPH *graph, const char *filename, struct JOB *job, time_t timestamp);
 struct NODE *node_find(struct GRAPH *graph, const char *filename);
 struct NODE *node_find_byhash(struct GRAPH *graph, hash_t hashid);
 struct NODE *node_get(struct GRAPH *graph, const char *filename);
-struct NODE *node_add_dependency(struct NODE *node, const char *filename);
-struct NODE *node_add_dependency_withnode(struct NODE *node, struct NODE *depnode);
-struct NODE *node_add_job_dependency_withnode(struct NODE *node, struct NODE *depnode);
-void node_set_pseudo(struct NODE *node);
+/*struct NODE *node_add_dependency(struct NODE *node, const char *filename);*/
+struct NODE *node_add_dependency(struct NODE *node, struct NODE *depnode);
 void node_cached(struct NODE *node);
 
-struct NODE *node_add_constraint_shared(struct NODE *node, const char *filename);
-struct NODE *node_add_constraint_exclusive(struct NODE *node, const char *filename);
+/* */
+struct NODE *node_add_constraint_shared(struct NODE *node, struct NODE *contraint);
+struct NODE *node_add_constraint_exclusive(struct NODE *node, struct NODE *contraint);
+
 
 struct NODEWALKPATH
 {

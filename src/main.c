@@ -59,8 +59,10 @@ struct OPTION
 };
 
 /* options passed via the command line */
+static int option_force = 0;
 static int option_clean = 0;
 static int option_no_cache = 0;
+static int option_no_scripttimestamp = 0;
 static int option_dry = 0;
 static int option_dependent = 0;
 static int option_abort_on_error = 0;
@@ -75,6 +77,9 @@ static int option_debug_trace_vm = 0;
 
 static int option_print_help = 0;
 static int option_print_debughelp = 0;
+
+static const char *option_debug_eventlog = NULL;
+static int option_debug_eventlogflush = 0;
 
 static const char *option_script = "bam.lua"; /* -f filename */
 static const char *option_threads_str = NULL;
@@ -127,6 +132,11 @@ static struct OPTION options[] = {
 	@END*/
 	{OF_PRINT, 0, &option_clean			, "-c", "clean targets"},
 
+	/*@OPTION Force ( -f )
+		Forces all the jobs to be dirty
+	@END*/
+	{OF_PRINT, 0, &option_force			, "-f", "force build"},
+
 	/*@OPTION Dependent build ( -d )
 		Builds all targets that are dependent on the given targets.
 		If no targets are given this option doesn't do anything.
@@ -175,9 +185,9 @@ static struct OPTION options[] = {
 		</ul>
 	@END*/
 	{OF_PRINT, &option_report_str,0		, "-r", "build progress report format (default: " DEFAULT_REPORT_STYLE ")\n"
-		"                       " "    b = progress bar\n"
-		"                       " "    c = use ansi colors\n"
-		"                       " "    s = build steps"},
+		"                            " "    b = progress bar\n"
+		"                            " "    c = use ansi colors\n"
+		"                            " "    s = build steps"},
 	
 	/*@OPTION Verbose ( -v )
 		Prints all commands that are runned when building.
@@ -190,6 +200,12 @@ static struct OPTION options[] = {
 		Do not use cache when building.
 	@END*/
 	{OF_PRINT, 0, &option_no_cache			, "-n", "don't use cache"},
+
+	/*@OPTION Ignore script timestamp ( -g )
+		Ignores the timestamp on the script when doing dirty checking.
+		Enabling this causes the output not to be rebuilt when the build script changes.
+	@END*/
+	{OF_PRINT, 0, &option_no_scripttimestamp, "-g", "ignore script timestamp"},
 
 	/*@OPTION Help ( -h, --help )
 		Prints out a short reference of the command line options and quits
@@ -241,6 +257,16 @@ static struct OPTION options[] = {
 	@END*/
 	{OF_DEBUG, 0, &option_debug_trace_vm	, "--debug-trace-vm", "prints a line for every instruction the vm makes"},
 
+	/*@OPTION Debug: Event Log ( --debug-eventlog FILENAME )
+		Outputs an build event log that contains all the events with timing information.
+	@END*/
+	{OF_DEBUG, &option_debug_eventlog, 0 		, "--debug-eventlog", "dumps all build events into a file"},
+
+	/*@OPTION Debug: Event Log Flush ( --debug-eventlog-flush )
+		Flushes the event log after each write.
+	@END*/
+	{OF_DEBUG, 0, &option_debug_eventlogflush	, "--debug-eventlog-flush", "flushes the eventlog after each write"},
+
 	/*@OPTION Debug: Dump Internal Scripts ( --debug-dump-int )
 	@END*/
 	{OF_DEBUG, 0, &option_debug_dumpinternal		, "--debug-dump-int", "prints the internals scripts to stdout"},
@@ -249,7 +275,7 @@ static struct OPTION options[] = {
 		Disables all the internal scripts that bam loads on startup.
 	@1, END*/
 	{OF_DEBUG, 0, &option_debug_nointernal		, "--debug-no-int", "don't load internal scripts"},
-		
+
 	/* terminate list */
 	{0, 0, 0, (const char*)0, (const char*)0}
 };
@@ -308,7 +334,6 @@ int register_lua_globals(struct CONTEXT *context)
 	lua_register(context->lua, L_FUNCTION_PREFIX"add_constraint_shared", lf_add_constraint_shared);
 	lua_register(context->lua, L_FUNCTION_PREFIX"add_constraint_exclusive", lf_add_constraint_exclusive);
 	lua_register(context->lua, L_FUNCTION_PREFIX"default_target", lf_default_target);
-	lua_register(context->lua, L_FUNCTION_PREFIX"set_touch", lf_set_touch);
 	lua_register(context->lua, L_FUNCTION_PREFIX"set_filter", lf_set_filter);
 
 	/* advanced dependency checkers */
@@ -335,10 +360,11 @@ int register_lua_globals(struct CONTEXT *context)
 	lua_register(context->lua, L_FUNCTION_PREFIX"listdir", lf_listdir);
 	lua_register(context->lua, L_FUNCTION_PREFIX"update_globalstamp", lf_update_globalstamp);
 	lua_register(context->lua, L_FUNCTION_PREFIX"loadfile", lf_loadfile);
-	lua_register(context->lua, L_FUNCTION_PREFIX"load_plugin", lf_loadplugin);
 	
 	lua_register(context->lua, L_FUNCTION_PREFIX"mkdir", lf_mkdir);
+	lua_register(context->lua, L_FUNCTION_PREFIX"mkdirs", lf_mkdirs);
 	lua_register(context->lua, L_FUNCTION_PREFIX"fileexist", lf_fileexist);
+	lua_register(context->lua, L_FUNCTION_PREFIX"nodeexist", lf_nodeexist);
 
 	lua_register(context->lua, L_FUNCTION_PREFIX"isstring", lf_isstring);
 	lua_register(context->lua, L_FUNCTION_PREFIX"istable", lf_istable);
@@ -395,6 +421,7 @@ int register_lua_globals(struct CONTEXT *context)
 	lua_setglobalstring(context->lua, "platform", BAM_PLATFORM_STRING);
 	lua_setglobalstring(context->lua, "arch", BAM_ARCH_STRING);
 	lua_setglobalstring(context->lua, "_bam_exe", session.exe);
+	lua_setglobalstring(context->lua, "_bam_modulefilename", context->filename);
 	lua_pushnumber(context->lua, session.verbose);
 	lua_setglobal(context->lua, "verbose");
 
@@ -441,10 +468,9 @@ int register_lua_globals(struct CONTEXT *context)
 	return error;
 }
 
-static int run_deferred_functions(struct CONTEXT *context)
+static int run_deferred_functions(struct CONTEXT *context, struct DEFERRED *cur)
 {
-	struct DEFERRED *cur;
-	for(cur = context->firstdeferred; cur; cur = cur->next)
+	for(; cur; cur = cur->next)
 	{
 		if(cur->run(context, cur))
 			return -1;
@@ -461,10 +487,12 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 	
 	/* set filename */
 	context->filename = scriptfile;
-	context->filename_short = path_filename(scriptfile);
 	
 	/* set global timestamp to the script file */
 	context->globaltimestamp = file_timestamp(scriptfile);
+
+	/* */
+	context->forced = option_force;
 	
 	/* fetch script directory */
 	{
@@ -491,16 +519,19 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 	}
 	
 	/* register all functions */
+	event_begin(0, "lua setup", NULL);
 	if(register_lua_globals(context) != 0)
 	{
 		printf("%s: error: registering of lua functions failed\n", session.name);
 		return -1;
 	}
+	event_end(0, "lua setup", NULL);
 
 	/* load script */	
 	if(session.verbose)
 		printf("%s: reading script from '%s'\n", session.name, scriptfile);
-		
+
+	event_begin(0, "script load", NULL);
 	/* push error function to stack and load the script */
 	lua_getglobal(context->lua, "errorfunc");
 	switch(luaL_loadfile(context->lua, scriptfile))
@@ -519,18 +550,37 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 			printf("%s: unknown error\n", session.name);
 			return -1;
 	}
+	event_end(0, "script load", NULL);
+
+	/* start the background stat thread */
+	node_graph_start_statthread(context->graph);
 
 	/* call the code chunk */	
+	event_begin(0, "script run", NULL);
 	if(lua_pcall(context->lua, 0, LUA_MULTRET, -2) != 0)
 	{
+		node_graph_end_statthread(context->graph);
 		printf("%s: script error (-t for more detail)\n", session.name);
 		return -1;
 	}
+	event_end(0, "script run", NULL);
+
+	/* stop the background stat thread */
+	event_begin(0, "stat", NULL);
+	node_graph_end_statthread(context->graph);
+	event_end(0, "stat", NULL);
 	
 	/* run deferred functions */
-	if(run_deferred_functions(context) != 0)
+	event_begin(0, "deferred cpp dependencies", NULL);
+	if(run_deferred_functions(context, context->firstdeferred_cpp) != 0)
 		return -1;
+	event_end(0, "deferred cpp dependencies", NULL);
 		
+	event_begin(0, "deferred search dependencies", NULL);
+	if(run_deferred_functions(context, context->firstdeferred_search) != 0)
+		return -1;
+	event_end(0, "deferred search dependencies", NULL);
+
 	/* */	
 	if(session.verbose)
 		printf("%s: making build target\n", session.name);
@@ -541,10 +591,9 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 		int all_target = 0;
 		int i;
 
-		if(node_create(&context->target, context->graph, "_bam_buildtarget", 0, 0))
+		if(node_create(&context->target, context->graph, "_bam_buildtarget", NULL, TIMESTAMP_PSEUDO))
 			return -1;
-		node_set_pseudo(context->target);
-			
+
 		if(num_targets)
 		{
 			/* search for all target */
@@ -569,7 +618,7 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 			{
 				if(node->firstparent == NULL && node != context->target)
 				{
-					if(!node_add_dependency_withnode(context->target, node))
+					if(!node_add_dependency (context->target, node))
 						return -1;
 				}
 			}
@@ -594,31 +643,34 @@ static int bam_setup(struct CONTEXT *context, const char *scriptfile, const char
 						struct NODELINK *parent;
 						for(parent = node->firstparent; parent; parent = parent->next)
 						{
-							if(!node_add_dependency_withnode(context->target, parent->node))
+							if(!node_add_dependency (context->target, parent->node))
 								return -1;
 						}
 								
 					}
 					else
 					{
-						if(!node_add_dependency_withnode(context->target, node))
+						if(!node_add_dependency (context->target, node))
 							return -1;
 					}
 				}
 			}
 			else
 			{
-				if(!node_add_dependency_withnode(context->target, context->defaulttarget))
+				if(!node_add_dependency (context->target, context->defaulttarget))
 					return -1;
 			}
 
 		}
 	}
-	
+
+	/* zero out the global timestamp if we don't want to use it */
+	if(option_no_scripttimestamp)
+		context->globaltimestamp = 0;
+
 	/* */	
 	if(session.verbose)
 		printf("%s: setup done\n", session.name);
-	
 	
 	/* return success */
 	return 0;
@@ -642,7 +694,7 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 	memset(&context, 0, sizeof(struct CONTEXT));
 	context.graphheap = mem_create();
 	context.deferredheap = mem_create();
-	context.graph = node_create_graph(context.graphheap);
+	context.graph = node_graph_create(context.graphheap);
 	context.exit_on_error = option_abort_on_error;
 	context.buildtime = timestamp();
 
@@ -667,7 +719,10 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 
 		string_hash_tostr(cache_hash, hashstr);
 		sprintf(cache_filename, ".bam/%s", hashstr);
+
+		event_begin(0, "cache load", cache_filename);
 		context.cache = cache_load(cache_filename);
+		event_end(0, "cache load", NULL);
 	}
 
 	/* do the setup */
@@ -676,17 +731,23 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 	/* done with the loopup heap */
 	mem_destroy(context.deferredheap);
 
-	/* if we have a separate lua heap, just destroy it */
-	if(context.luaheap)
-		mem_destroy(context.luaheap);
-	else
-		lua_close(context.lua);
+	/* close the lua state */
+	lua_close(context.lua);
 	
 	/* do actions if we don't have any errors */
 	if(!setup_error)
 	{
+		event_begin(0, "prepare", NULL);
 		build_error = context_build_prepare(&context);
+		event_end(0, "prepare", NULL);
 		
+		if(!build_error)
+		{
+			event_begin(0, "prioritize", NULL);
+			build_error = context_build_prioritize(&context);
+			event_end(0, "prioritize", NULL);
+		}
+
 		if(!build_error)
 		{
 			if(option_debug_nodes) /* debug dump all nodes */
@@ -706,10 +767,16 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 			{
 				/* run build or clean */
 				if(option_clean)
+				{
+					event_begin(0, "clean", NULL);
 					build_error = context_build_clean(&context);
+					event_end(0, "end", NULL);
+				}
 				else
 				{
+					event_begin(0, "build", NULL);
 					build_error = context_build_make(&context);
+					event_end(0, "build", NULL);
 					report_done = 1;
 				}
 			}
@@ -718,10 +785,16 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 
 	/* save cache (thread?) */
 	if(option_no_cache == 0 && setup_error == 0)
+	{
+		event_begin(0, "cache save", cache_filename);
 		cache_save(cache_filename, context.graph);
+		event_end(0, "cache save", NULL);
+	}
 	
 	/* clean up */
 	mem_destroy(context.graphheap);
+	free(context.joblist);
+	cache_free(context.cache);
 
 	/* print final report and return */
 	if(setup_error)
@@ -733,7 +806,7 @@ static int bam(const char *scriptfile, const char **targets, int num_targets)
 		printf("%s: error: a build step failed\n", session.name);
 	else if(report_done)
 	{
-		if(context.num_commands == 0)
+		if(context.num_jobs == 0)
 			printf("%s: targets are up to date already\n", session.name);
 		else
 		{
@@ -774,7 +847,7 @@ static void print_help(int mask)
 	for(j = 0; options[j].sw; j++)
 	{
 		if(options[j].flags&mask)
-			printf("  %-20s %s\n", options[j].sw, options[j].desc);
+			printf("  %-25s %s\n", options[j].sw, options[j].desc);
 	}
 	printf("\n");
 	printf("bam version " BAM_VERSION_STRING_COMPLETE ". built "__DATE__" "__TIME__" using " LUA_VERSION "\n");
@@ -921,7 +994,19 @@ int main(int argc, char **argv)
 	/* parse commandline parameters */
 	if(parse_parameters(argc-1, argv+1))
 		return -1;
-		
+
+	/* set eventlog */
+	if(option_debug_eventlog)
+	{
+		session.eventlog = fopen(option_debug_eventlog, "w");
+		session.eventlogflush = option_debug_eventlogflush;
+		if(!session.eventlog)
+		{
+			printf("%s: error opening '%s' for output\n", session.name, option_debug_eventlog);
+			return 1;
+		}
+	}
+
 	/* parse the report str */
 	for(i = 0; option_report_str[i]; i++)
 	{
@@ -980,9 +1065,11 @@ int main(int argc, char **argv)
 	
 	platform_shutdown();
 
+
 	/* error could be some high value like 256 seams like this could */
 	/* be clamped down to a unsigned char and not be an error anymore */
 	if(error)
 		return 1;
+
 	return 0;
 }

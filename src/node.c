@@ -13,27 +13,127 @@
 
 #include "nodelinktree.inl"
 
+
+static char *duplicate_string(struct GRAPH *graph, const char *src, size_t len)
+{
+	char *str = (char *)mem_allocate(graph->heap, len+1);
+	memcpy(str, src, len);
+	str[len] = 0;
+	return str;
+}
+
 /* */
-struct GRAPH *node_create_graph(struct HEAP *heap)
+struct GRAPH *node_graph_create(struct HEAP *heap)
 {
 	/* allocate graph structure */
 	struct GRAPH *graph = (struct GRAPH*)mem_allocate(heap, sizeof(struct GRAPH));
 	if(!graph)
 		return (struct GRAPH *)0x0;
-		
-	memset(graph, 0, sizeof(struct GRAPH));
 
 	/* init */
 	graph->heap = heap;
 	return graph; 
 }
 
+/*
+	fetches the timestamp for the node and updates the dirty if the file is missing
+*/
+static void node_stat(struct NODE *node)
+{
+	node->timestamp_raw = file_timestamp(node->filename);
+	node->timestamp = node->timestamp_raw;
+	if(node->timestamp_raw == 0)
+		node->dirty = NODEDIRTY_MISSING;
+}
+
+static void stat_thread(void *user)
+{
+	struct GRAPH *graph = (struct GRAPH *)user;
+	struct NODE *node = NULL;
+	unsigned count = 0;
+	unsigned loops = 0;
+
+	while(1)
+	{
+		/* find the next stat node */
+		struct NODE *next = NULL;
+		if(node)
+			next = node->nextstat;
+		else
+			next = graph->firststatnode;
+
+		loops++;
+
+		if(next)
+		{
+			count++;
+			node = next;
+
+			/* stat the node */
+			node_stat(node);
+			sync_barrier();
+		}
+		else
+		{
+			/* check if we should finish */
+			if(node == graph->finalstatnode)
+				break;
+
+			/* be a little nice for now */
+			threads_yield();
+		}
+	}
+}
+
+void node_graph_start_statthread(struct GRAPH *graph)
+{
+	graph->finalstatnode = (struct NODE *)0x1;
+	sync_barrier();
+	graph->statthread = threads_create(stat_thread, graph);
+}
+
+void node_graph_end_statthread(struct GRAPH *graph)
+{
+	graph->finalstatnode = graph->laststatnode;
+	sync_barrier();
+	threads_join(graph->statthread);
+	graph->statthread = NULL;
+}
+
+
+struct JOB *node_job_create_null(struct GRAPH *graph)
+{
+	struct JOB *job = (struct JOB *)mem_allocate(graph->heap, sizeof(struct JOB));
+	job->graph = graph;
+	return job;
+}
+
+
+struct JOB *node_job_create(struct GRAPH *graph, const char *label, const char *cmdline)
+{
+	struct JOB *job = node_job_create_null(graph);
+	job->real = 1;
+	graph->num_jobs++;
+
+	/* set label and command */
+	job->label = duplicate_string(graph, label, strlen(label));
+	job->cmdline = duplicate_string(graph, cmdline, strlen(cmdline));
+	job->cmdhash = string_hash(cmdline);
+	job->cachehash = job->cmdhash;
+
+	/* add it to the list */
+	job->next = graph->firstjob;
+	graph->firstjob = job;
+	
+	return job;
+}
+
 /* creates a node */
-int node_create(struct NODE **nodeptr, struct GRAPH *graph, const char *filename, const char *label, const char *cmdline)
+int node_create(struct NODE **nodeptr, struct GRAPH *graph, const char *filename, struct JOB *job, time_t timestamp)
 {
 	struct NODE *node;
-	struct NODETREELINK *link;
-	int sn;
+	struct NODELINK *link;
+	struct NODETREELINK *treelink;
 	hash_t hashid = string_hash(filename);
 
 	/* check arguments */
@@ -43,29 +143,18 @@ int node_create(struct NODE **nodeptr, struct GRAPH *graph, const char *filename
 		return NODECREATE_NOTNICE;
 	}
 	
-	if(cmdline && !label)
-	{
-		printf("%s: error: adding job '%s' with command but no label\n", session.name, filename);
-		return NODECREATE_INVALID_ARG;
-	}
-	else if(!cmdline && label)
-	{
-		printf("%s: error: adding job '%s' with label but no command\n", session.name, filename);
-		return NODECREATE_INVALID_ARG;
-	}
-	
 	/* zero out the return pointer */
 	*nodeptr = (struct NODE *)0x0;
 		
 	/* search for the node */
-	link = nodelinktree_find_closest(graph->nodehash[hashid&0xffff], hashid);
-	if(link && link->node->hashid == hashid)
+	treelink = nodelinktree_find_closest(graph->nodehash[hashid&0xffff], hashid);
+	if(treelink && treelink->node->hashid == hashid)
 	{
 		/* we are allowed to create a new node from a node that doesn't
 			have a job assigned to it*/
-		if(link->node->cmdline || cmdline == NULL)
-			return NODECREATE_EXISTS;
-		node = link->node;
+		/*if(link->node->cmdline || cmdline == NULL)
+			return NODECREATE_EXISTS;*/
+		node = treelink->node;
 	}
 	else
 	{
@@ -74,42 +163,68 @@ int node_create(struct NODE **nodeptr, struct GRAPH *graph, const char *filename
 		
 		node->graph = graph;
 		node->id = graph->num_nodes++;
-		node->timestamp_raw = file_timestamp(filename);
-		node->timestamp = node->timestamp_raw;
-		
-		if(node->timestamp_raw == 0)
-			node->dirty = NODEDIRTY_MISSING;
 		
 		/* set filename */
 		node->filename_len = strlen(filename)+1;
-		node->filename = (char *)mem_allocate(graph->heap, node->filename_len);
-		memcpy(node->filename, filename, node->filename_len);
+		node->filename = duplicate_string(graph, filename, node->filename_len);
 		node->hashid = hashid;
 		
 		/* add to hashed tree */
-		nodelinktree_insert(&graph->nodehash[node->hashid&0xffff], link, node);
+		nodelinktree_insert(&graph->nodehash[node->hashid&0xffff], treelink, node);
 
 		/* add to list */
 		if(graph->last) graph->last->next = node;
 		else graph->first = node;
 		graph->last = node;		
+
+		/* fix timestamp */
+		if(timestamp >= 0)
+		{
+			node->timestamp = timestamp;
+			node->timestamp_raw = timestamp;
+		}
+		else
+		{
+			if(graph->statthread)
+			{
+				/* make sure that the node is written down before we queue it for a stat */
+				sync_barrier();
+				if(graph->laststatnode)
+					graph->laststatnode->nextstat = node;
+				else
+					graph->firststatnode = node;
+				graph->laststatnode = node;	
+			}
+			else
+			{
+				/* no stat-thread running, do it here and now */
+				node_stat(node);
+			}
+		}
 	}
-	
-	/* set command and label */
-	if(cmdline)
+
+
+	/* set job */
+	if(job)
 	{
-		sn = strlen(cmdline)+1;
-		node->cmdline = (char *)mem_allocate(graph->heap, sn);
-		memcpy(node->cmdline, cmdline, sn);
-		node->cmdhash = string_hash(cmdline);
-		node->cachehash = node->cmdhash;
-		
-		/* set label */
-		sn = strlen(label)+1;
-		node->label = (char *)mem_allocate(graph->heap, sn);
-		memcpy(node->label, label, sn);
+		if(node->job && node->job->real)
+		{
+			printf("%s: error: job '%s' already exists\n", session.name, filename);
+			return NODECREATE_EXISTS;
+		}
+
+		/* TODO: we might have to transfer properties from the old job to the new? */
+		node->job = job;
+
+		/* link into output list */
+		link = (struct NODELINK *)mem_allocate(graph->heap, sizeof(struct NODELINK));
+		link->node = node;
+		link->next = job->firstoutput;
+		job->firstoutput = link;
 	}
-	
+	else
+		node->job = node_job_create_null(graph);
+
 	/* return new node */
 	*nodeptr = node;
 	return NODECREATE_OK;
@@ -137,13 +252,13 @@ struct NODE *node_get(struct GRAPH *graph, const char *filename)
 	
 	if(!node)
 	{
-		if(node_create(&node, graph, filename, 0, 0) == NODECREATE_OK)
+		if(node_create(&node, graph, filename, NULL, TIMESTAMP_NONE) == NODECREATE_OK)
 			return node;
 	}
 	return node;
 }
 
-struct NODE *node_add_dependency_withnode(struct NODE *node, struct NODE *depnode)
+struct NODE *node_add_dependency (struct NODE *node, struct NODE *depnode)
 {
 	struct NODELINK *dep;
 	struct NODELINK *parent;
@@ -152,7 +267,7 @@ struct NODE *node_add_dependency_withnode(struct NODE *node, struct NODE *depnod
 	/* make sure that the node doesn't try to depend on it self */
 	if(depnode == node)
 	{
-		if(node->cmdline)
+		if(node->job->real)
 		{
 			printf("error: node '%s' is depended on itself and is produced by a job\n", node->filename);
 			return (struct NODE*)0x0;
@@ -188,7 +303,7 @@ struct NODE *node_add_dependency_withnode(struct NODE *node, struct NODE *depnod
 }
 
 
-struct NODE *node_add_job_dependency_withnode(struct NODE *node, struct NODE *depnode)
+struct NODE *node_job_add_dependency (struct NODE *node, struct NODE *depnode)
 {
 	struct NODELINK *dep;
 	struct NODETREELINK *treelink;
@@ -196,7 +311,7 @@ struct NODE *node_add_job_dependency_withnode(struct NODE *node, struct NODE *de
 	/* make sure that the node doesn't try to depend on it self */
 	if(depnode == node)
 	{
-		if(node->cmdline)
+		if(node->job->real)
 		{
 			printf("error: node '%s' is depended on itself and is produced by a job\n", node->filename);
 			return (struct NODE*)0x0;
@@ -206,34 +321,34 @@ struct NODE *node_add_job_dependency_withnode(struct NODE *node, struct NODE *de
 	}
 
 	/* check if we are already dependent on this node */
-	treelink = nodelinktree_find_closest(node->jobdeproot, depnode->hashid);
+	treelink = nodelinktree_find_closest(node->job->jobdeproot, depnode->hashid);
 	if(treelink != NULL && treelink->node->hashid == depnode->hashid)
 		return depnode;
 	
 	/* create and add job dependency link */
 	dep = (struct NODELINK *)mem_allocate(node->graph->heap, sizeof(struct NODELINK));
 	dep->node = depnode;
-	dep->next = node->firstjobdep;
-	node->firstjobdep = dep;
+	dep->next = node->job->firstjobdep;
+	node->job->firstjobdep = dep;
 	
-	nodelinktree_insert(&node->jobdeproot, treelink, depnode);	
+	nodelinktree_insert(&node->job->jobdeproot, treelink, depnode);	
 	
 	return depnode;
 }
 
 
 /* adds a dependency to a node */
+/*
 struct NODE *node_add_dependency(struct NODE *node, const char *filename)
 {
 	struct NODE *depnode = node_get(node->graph, filename);
 	if(!depnode)
 		return NULL;
-	return node_add_dependency_withnode(node, depnode);
-}
+	return node_add_dependency (node, depnode);
+}*/
 
-static struct NODE *node_add_constraint(struct NODELINK **first, struct NODE *node, const char *filename)
+static struct NODE *node_add_constraint (struct NODELINK **first, struct NODE *node, struct NODE *contraint)
 {
-	struct NODE *contraint = node_get(node->graph, filename);
 	struct NODELINK *link = (struct NODELINK *)mem_allocate(node->graph->heap, sizeof(struct NODELINK));
 	link->node = contraint;
 	link->next = *first;
@@ -241,25 +356,19 @@ static struct NODE *node_add_constraint(struct NODELINK **first, struct NODE *no
 	return contraint;
 }
 
-struct NODE *node_add_constraint_shared(struct NODE *node, const char *filename)
+struct NODE *node_add_constraint_shared (struct NODE *node, struct NODE *contraint)
 {
-	return node_add_constraint(&node->constraint_shared, node, filename);
+	return node_add_constraint (&node->constraint_shared, node, contraint);
 }
 
-struct NODE *node_add_constraint_exclusive(struct NODE *node, const char *filename)
+struct NODE *node_add_constraint_exclusive (struct NODE *node, struct NODE *contraint)
 {
-	return node_add_constraint(&node->constraint_exclusive, node, filename);
+	return node_add_constraint (&node->constraint_exclusive, node, contraint);
 }
 
 void node_cached(struct NODE *node)
 {
 	node->cached = 1;
-}
-
-void node_set_pseudo(struct NODE *node)
-{
-	node->timestamp = 1;
-	node->timestamp_raw = 1;
 }
 
 /* functions to handle with bit array access */
@@ -299,7 +408,7 @@ static int node_walk_r(
 	
 	if(flags&NODEWALK_UNDONE)
 	{
-		if(node->workstatus != NODESTATUS_UNDONE)
+		if(node->job->status != JOBSTATUS_UNDONE)
 			return 0;
 	}
 
@@ -318,7 +427,7 @@ static int node_walk_r(
 	/* build all dependencies */
 	dep = node->firstdep;
 	if(flags&NODEWALK_JOBS)
-		dep = node->firstjobdep;
+		dep = node->job->firstjobdep;
 	for(; dep; dep = dep->next)
 	{
 		result = node_walk_r(walk, dep->node);
@@ -469,10 +578,10 @@ void node_debug_dump_detailed(struct GRAPH *graph)
 	
 	for(;node;node = node->next)
 	{
-		static const char *dirtyflag[] = {"--", "MI", "CH", "DD", "DN", "GS"};
+		static const char *dirtyflag[] = {"--", "MI", "CH", "DD", "DN", "GS", "FO"};
 		tool = "***";
-		if(node->cmdline)
-			tool = node->cmdline;
+		if(node->job)
+			tool = node->job->cmdline;
 		printf("%08x %s   %s   %-15s\n", (unsigned)node->timestamp, dirtyflag[node->dirty], node->filename, tool);
 		for(link = node->firstdep; link; link = link->next)
 			printf("%08x %s      DEPEND %s\n", (unsigned)link->node->timestamp, dirtyflag[link->node->dirty], link->node->filename);
@@ -482,7 +591,7 @@ void node_debug_dump_detailed(struct GRAPH *graph)
 			printf("%08x %s      SHARED %s\n", (unsigned)link->node->timestamp, dirtyflag[link->node->dirty], link->node->filename);
 		for(link = node->constraint_exclusive; link; link = link->next)
 			printf("%08x %s      EXCLUS %s\n", (unsigned)link->node->timestamp, dirtyflag[link->node->dirty], link->node->filename);
-		for(link = node->firstjobdep; link; link = link->next)
+		for(link = node->job->firstjobdep; link; link = link->next)
 			printf("%08x %s      JOBDEP %s\n", (unsigned)link->node->timestamp, dirtyflag[link->node->dirty], link->node->filename);
 	}
 }
@@ -523,7 +632,7 @@ static int node_debug_dump_jobs_dot_callback(struct NODEWALK *walkinfo)
 		return 0;
 
 	printf("node%d [shape=box, label=\"%s\"];\n", node->id, node->filename);
-	for(link = node->firstjobdep; link; link = link->next)
+	for(link = node->job->firstjobdep; link; link = link->next)
 		printf("node%d -> node%d;\n", link->node->id, node->id);
 	return 0;
 }
@@ -540,19 +649,21 @@ void node_debug_dump_jobs_dot(struct GRAPH *graph, struct NODE *top)
 void node_debug_dump_jobs(struct GRAPH *graph)
 {
 	struct NODELINK *link;
-	struct NODE *node = graph->first;
-	static const char *dirtyflag[] = {"--", "MI", "CH", "DD", "DN", "GS"};
+	struct JOB *job = graph->firstjob;
+
+	static const char *dirtyflag[] = {"--", "MI", "CH", "DD", "DN", "GS", "FO"};
 	printf("MI = Missing CH = Command hash dirty, DD = Dependency dirty\n");
-	printf("DN = Dependency is newer, GS = Global stamp is newer\n");
-	printf("Dirty Depth %-30s   Command\n", "Filename");
-	for(;node;node = node->next)
+	printf("DN = Dependency is newer, GS = Global stamp is newer, FO = Forced dirty\n");
+	printf("Dirty %-30s Command\n", "Label");
+	for(;job;job = job->next)
 	{
-		if(node->cmdline)
-		{
-			printf(" %s    %3d  %-30s   %s\n", dirtyflag[node->dirty], node->depth, node->filename, node->cmdline);
-			
-			for(link = node->firstjobdep; link; link = link->next)
-				printf(" %s         + %-30s\n", dirtyflag[link->node->dirty], link->node->filename);
-		}
+
+		printf(" %s   %-30s %s\n", "  ", job->label, job->cmdline);
+		
+		for(link = job->firstoutput; link; link = link->next)
+			printf(" %s     OUTPUT %-30s\n", dirtyflag[link->node->dirty], link->node->filename);
+
+		for(link = job->firstjobdep; link; link = link->next)
+			printf(" %s     DEPEND %-30s\n", dirtyflag[link->node->dirty], link->node->filename);
 	}
 }

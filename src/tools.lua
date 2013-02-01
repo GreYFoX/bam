@@ -271,6 +271,7 @@ AddTool(function (settings)
 	InitCommonCCompiler(settings)
 	settings.compile.mappings["c"] = CompileC
 	settings.compile.mappings["m"] = CompileC
+	settings.compile.mappings["S"] = CompileC
 end)
 
 AddTool(function (settings)
@@ -289,9 +290,8 @@ if family == "windows" then
 	function CopyFile(dst, src)
 		AddJob(dst,
 			"copy " .. src .. " -> " .. dst,
-			"copy /b " .. str_replace(src, "/", "\\") .. " " .. str_replace(dst, "/", "\\") .. " >nul 2>&1",
+			"copy /b \"" .. str_replace(src, "/", "\\") .. "\" \"" .. str_replace(dst, "/", "\\") .. "\" >nul 2>&1",
 			src)
-		SetTouch(dst) -- make sure to update timestamp
 		return dst
 	end
 else
@@ -300,7 +300,6 @@ else
 			"copy " .. src .. " -> " .. dst,
 			"cp " .. src .. " " .. dst,
 			src)
-		SetTouch(dst)
 		return dst
 	end
 end

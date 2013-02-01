@@ -6,20 +6,20 @@ if exist "%VCINSTALLDIR%" (
 )
 
 @REM Check for Visual Studio
-if exist "%VS110COMNTOOLS%" (
-	set VSPATH="%VS110COMNTOOLS%"
+if defined VS110COMNTOOLS (
+	call set VSPATH=%%VS110COMNTOOLS%%
 	goto set_env
 )
-if exist "%VS100COMNTOOLS%" (
-	set VSPATH="%VS100COMNTOOLS%"
+if defined VS100COMNTOOLS (
+	call set VSPATH=%%VS100COMNTOOLS%%
 	goto set_env
 )
-if exist "%VS90COMNTOOLS%" (
-	set VSPATH="%VS90COMNTOOLS%"
+if defined VS90COMNTOOLS" (
+	call set VSPATH=%%VS90COMNTOOLS%%
 	goto set_env
 )
-if exist "%VS80COMNTOOLS%" (
-	set VSPATH="%VS80COMNTOOLS%"
+if defined VS80COMNTOOLS (
+	call set VSPATH=%%VS80COMNTOOLS%%
 	goto set_env
 )
 
@@ -27,9 +27,16 @@ echo You need Microsoft Visual Studio 8, 9, 10 or 11 installed
 pause
 exit
 
-@ setup the environment
+@ set up the environment
 :set_env
-call %VSPATH%vsvars32.bat
+if exist "%VSPATH%..\..\vc\vcvarsall.bat" (
+	call "%%VSPATH%%..\..\vc\vcvarsall.bat" amd64
+	goto compile
+)
+
+echo Unable to set up the environment
+pause
+exit
 
 :compile
 @echo === building bam ===
@@ -49,4 +56,3 @@ call %VSPATH%vsvars32.bat
 @REM clean up
 @del bam.exp
 @del *.obj
-

@@ -16,10 +16,10 @@ int lf_add_pseudo(struct lua_State *L);
 int lf_add_dependency(struct lua_State *L);
 int lf_add_constraint_shared(struct lua_State *L);
 int lf_add_constraint_exclusive(struct lua_State *L);
-int lf_set_touch(struct lua_State *L);
 int lf_set_filter(struct lua_State *L);
 int lf_default_target(struct lua_State *L);
 int lf_update_globalstamp(struct lua_State *L);
+int lf_nodeexist(struct lua_State *L);
 
 /* dependency */
 int lf_add_dependency_cpp_set_paths(lua_State *L); /* dep_cpp.c */
@@ -35,6 +35,7 @@ int lf_listdir(struct lua_State *L);
 
 /* support, files and dirs */
 int lf_mkdir(struct lua_State *L);
+int lf_mkdirs(struct lua_State *L);
 int lf_fileexist(struct lua_State *L);
 
 /* table functions*/
@@ -49,5 +50,4 @@ int lf_isstring(struct lua_State *L);
 int lf_loadfile(struct lua_State *L);
 int lf_errorfunc(struct lua_State *L);
 int lf_panicfunc(struct lua_State *L);
-int lf_loadplugin(struct lua_State *L);
 

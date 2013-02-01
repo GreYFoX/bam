@@ -241,6 +241,8 @@ test("collect_recurse")
 test("sharedlib")
 test("deadlock")
 test("addorder")
+test("import")
+test("multipleoutput")
 
 if len(failed_tests):
 	print "FAILED TESTS:"

@@ -23,20 +23,23 @@ struct DEPPLAIN
 static int checkpath(struct CONTEXT *context, struct NODE *node, const char *path)
 {
 	struct NODE *depnode;
+	time_t stamp;
 
 	/* search up the node and add it if we need */
 	depnode = node_find(context->graph, path);
 	if(depnode)
 	{
-		if(!node_add_dependency_withnode(node, depnode))
+		if(!node_add_dependency (node, depnode))
 			return -1;
 		return 1;
 	}
 	
 	/* check if it exists on the disk */
-	if(file_exist(path))
+	stamp = file_timestamp(path);
+	if(stamp)
 	{
-		if(!node_add_dependency(node, path))
+		node_create(&depnode, node->graph, path, NULL, stamp);
+		if(!node_add_dependency (node, depnode))
 			return -1;
 		return 1;
 	}
@@ -109,8 +112,8 @@ int lf_add_dependency_search(lua_State *L)
 	deferred->node = node;
 	deferred->user = plain;
 	deferred->run = do_run;
-	deferred->next = context->firstdeferred;
-	context->firstdeferred = deferred;
+	deferred->next = context->firstdeferred_search;
+	context->firstdeferred_search = deferred;
 		
 	/* allocate the lookup */
 	plain->firstpath = NULL;

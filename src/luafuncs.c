@@ -75,9 +75,12 @@ static void deep_walk_r(lua_State *L, int table_index)
 			luaL_error(L, "encountered something besides a string or a table");
 		}
 
-		/* pop +1 */
+		/* pop -1 */
 		lua_pop(L, 1);
 	}
+
+	/* pop -1 */
+	lua_pop(L, 1);
 }
 
 static void deep_walk(lua_State *L, int start, int stop, void (*callback)(lua_State*, void*), void *user)
@@ -119,15 +122,13 @@ int lf_add_pseudo(lua_State *L)
 	context = context_get_pointer(L);
 
 	/* create the node */
-	i = node_create(&node, context->graph, lua_tostring(L,1), NULL, NULL);
+	i = node_create(&node, context->graph, lua_tostring(L,1), NULL, TIMESTAMP_PSEUDO);
 	if(i == NODECREATE_NOTNICE)
 		luaL_error(L, "add_pseudo: node '%s' is not nice", lua_tostring(L,1));
 	else if(i == NODECREATE_EXISTS)
 		luaL_error(L, "add_pseudo: node '%s' already exists", lua_tostring(L,1));
 	else if(i != NODECREATE_OK)
 		luaL_error(L, "add_pseudo: unknown error creating node '%s'", lua_tostring(L,1));
-		
-	node_set_pseudo(node);
 	return 0;
 }
 
@@ -137,6 +138,8 @@ int lf_add_output(lua_State *L)
 	struct NODE *output;
 	struct NODE *other_output;
 	struct CONTEXT *context;
+	int i;
+	const char *filename;
 	
 	if(lua_gettop(L) != 2)
 		luaL_error(L, "add_output: incorrect number of arguments");
@@ -150,30 +153,39 @@ int lf_add_output(lua_State *L)
 	if(!output)
 		luaL_error(L, "add_output: couldn't find node with name '%s'", lua_tostring(L,1));
 
-	other_output = node_get(context->graph, lua_tostring(L,2));
-	if(!other_output)
-		luaL_error(L, "add_output: couldn't find node with name '%s'", lua_tostring(L,2));
-	
-	node_add_dependency_withnode(other_output, output);
-	node_set_pseudo(other_output);
+	if(!output->job->real)
+		luaL_error(L, "add_output: '%s' does not have a job", lua_tostring(L,1));
+
+
+	filename = lua_tostring(L, -1);
+	i = node_create(&other_output, context->graph, filename, output->job, TIMESTAMP_NONE);
+	if(i == NODECREATE_NOTNICE)
+		luaL_error(L, "add_output: node '%s' is not nice", filename);
+	else if(i == NODECREATE_EXISTS)
+		luaL_error(L, "add_output: node '%s' already exists", filename);
+	else if(i != NODECREATE_OK)
+		luaL_error(L, "add_output: unknown error creating node '%s'", filename);
+
 	return 0;
 }
 
 struct NODEATTRIB_CBINFO
 {
 	struct NODE *node;
-	struct NODE *(*callback)(struct NODE*, const char *);
+	struct NODE *(*callback)(struct NODE*, struct NODE*);
 };
 
 static void callback_node_attrib(lua_State *L, void *user)
 {
 	struct NODEATTRIB_CBINFO *info = (struct NODEATTRIB_CBINFO *)user;
-	if(!info->callback(info->node, lua_tostring(L, -1)))
-		luaL_error(L, "could not add '%s' to '%s'", lua_tostring(L, -1), lua_tostring(L, 1));
+	const char *othername = lua_tostring(L, -1);
+	struct NODE *othernode = node_get(info->node->graph, othername);
+	if(!info->callback(info->node, othernode))
+		luaL_error(L, "could not add '%s' to '%s'", othername, lua_tostring(L, 1));
 }
 
 /* add_dependency(string node, string dependency) */
-static int add_node_attribute(lua_State *L, const char *funcname, struct NODE *(*callback)(struct NODE*, const char *))
+static int add_node_attribute(lua_State *L, const char *funcname, struct NODE *(*callback)(struct NODE*, struct NODE*))
 {
 	struct NODE *node;
 	struct CONTEXT *context;
@@ -198,62 +210,71 @@ static int add_node_attribute(lua_State *L, const char *funcname, struct NODE *(
 	return 0;
 }
 
-int lf_add_dependency(lua_State *L) { return add_node_attribute(L, "add_dependency", node_add_dependency); }
-int lf_add_constraint_shared(lua_State *L) { return add_node_attribute(L, "add_constraint_shared", node_add_constraint_shared); }
-int lf_add_constraint_exclusive(lua_State *L) { return add_node_attribute(L, "add_constraint_exclusive", node_add_constraint_exclusive); }
+int lf_add_dependency(lua_State *L) { return add_node_attribute(L, "add_dependency", node_add_dependency ); }
+int lf_add_constraint_shared(lua_State *L) { return add_node_attribute(L, "add_constraint_shared", node_add_constraint_shared ); }
+int lf_add_constraint_exclusive(lua_State *L) { return add_node_attribute(L, "add_constraint_exclusive", node_add_constraint_exclusive ); }
 
-/* add_job(string output, string label, string command, ...) */
+static void callback_addjob_node(lua_State *L, void *user)
+{
+	struct JOB *job = (struct JOB *)user;
+	struct CONTEXT *context = context_get_pointer(L);
+	struct NODE *node;
+	const char *filename;
+	int i;
+
+	luaL_checktype(L, -1, LUA_TSTRING);
+	filename = lua_tostring(L, -1);
+
+	i = node_create(&node, context->graph, filename, job, TIMESTAMP_NONE);
+	if(i == NODECREATE_NOTNICE)
+		luaL_error(L, "add_job: node '%s' is not nice", filename);
+	else if(i == NODECREATE_EXISTS)
+		luaL_error(L, "add_job: node '%s' already exists", filename);
+	else if(i != NODECREATE_OK)
+		luaL_error(L, "add_job: unknown error creating node '%s'", filename);
+}
+
+
+static void callback_addjob_deps(lua_State *L, void *user)
+{
+	struct JOB *job = (struct JOB *)user;
+	struct NODELINK *link;
+	const char *filename;
+
+	luaL_checktype(L, -1, LUA_TSTRING);
+	filename = lua_tostring(L, -1);
+
+	for(link = job->firstoutput; link; link = link->next)
+		node_add_dependency (link->node, node_get(link->node->graph, filename));
+}
+
+/* add_job(string/table output, string label, string command, ...) */
 int lf_add_job(lua_State *L)
 {
-	struct NODE *node;
+	struct JOB *job;
 	struct CONTEXT *context;
-	struct NODEATTRIB_CBINFO cbinfo;
-	int i;
 	
 	if(lua_gettop(L) < 3)
 		luaL_error(L, "add_job: too few arguments");
 
-	luaL_checktype(L, 1, LUA_TSTRING);
+	/*luaL_checktype(L, 1, LUA_TSTRING); */
 	luaL_checktype(L, 2, LUA_TSTRING);
 	luaL_checktype(L, 3, LUA_TSTRING);
 	
 	/* fetch contexst from lua */
 	context = context_get_pointer(L);
 
-	/* create the node */
-	i = node_create(&node, context->graph, lua_tostring(L,1), lua_tostring(L,2), lua_tostring(L,3));
-	if(i == NODECREATE_NOTNICE)
-		luaL_error(L, "add_job: node '%s' is not nice", lua_tostring(L,1));
-	else if(i == NODECREATE_EXISTS)
-		luaL_error(L, "add_job: node '%s' already exists", lua_tostring(L,1));
-	else if(i != NODECREATE_OK)
-		luaL_error(L, "add_job: unknown error creating node '%s'", lua_tostring(L,1));
-		
+	/* create the job */
+	job = node_job_create(context->graph, lua_tostring(L,2), lua_tostring(L,3));
+
+	/* create the nodes */
+	deep_walk(L, 1, 1, callback_addjob_node, job);
+
 	/* seek deps */
-	cbinfo.node = node;
-	cbinfo.callback = node_add_dependency;
-	deep_walk(L, 4, lua_gettop(L), callback_node_attrib, &cbinfo);
-	
+	deep_walk(L, 4, lua_gettop(L), callback_addjob_deps, job);
+
 	return 0;
 }
-
-int lf_set_touch(struct lua_State *L)
-{
-	struct NODE *node;
-	
-	if(lua_gettop(L) < 1)
-		luaL_error(L, "set_touch: too few arguments");
-
-	luaL_checktype(L, 1, LUA_TSTRING);
-	
-	node = node_find(context_get_pointer(L)->graph, lua_tostring(L,1));
-	if(!node)
-		luaL_error(L, "set_touch: couldn't find node with name '%s'", lua_tostring(L,1));
-		
-	node->touch = 1;
-	return 0;
-}
-
 
 int lf_set_filter(struct lua_State *L)
 {
@@ -275,10 +296,29 @@ int lf_set_filter(struct lua_State *L)
 
 	/* setup the string */	
 	str = lua_tolstring(L, 2, &len);
-	node->filter = (char *)mem_allocate(node->graph->heap, len+1);
-	memcpy(node->filter, str, len+1);
+	node->job->filter = (char *)mem_allocate(node->graph->heap, len+1);
+	memcpy(node->job->filter, str, len+1);
 	return 0;
 }
+
+/* nodeexist(string nodename) */
+int lf_nodeexist(struct lua_State *L)
+{
+	struct NODE *node;
+	
+	if(lua_gettop(L) != 1)
+		luaL_error(L, "nodeexists: takes exactly one argument");
+
+	luaL_checktype(L, 1, LUA_TSTRING);
+	
+	node = node_find(context_get_pointer(L)->graph, lua_tostring(L,1));
+	if(!node)
+		lua_pushboolean(L, 1);
+	else
+		lua_pushboolean(L, 0);
+	return 1;
+}
+
 
 /* default_target(string filename) */
 int lf_default_target(lua_State *L)
@@ -447,6 +487,20 @@ int lf_mkdir(struct lua_State *L)
 	return 1;
 }
 
+int lf_mkdirs(struct lua_State *L)
+{
+	if(lua_gettop(L) < 1)
+		luaL_error(L, "mkdirs: too few arguments");	
+
+	if(!lua_isstring(L,1))
+		luaL_error(L, "mkdirs: expected string");
+		
+	if(file_createpath(lua_tostring(L,1)) == 0)
+		lua_pushnumber(L, 1);	
+	else
+		lua_pushnil(L);
+	return 1;
+}
 
 int lf_fileexist(struct lua_State *L)
 {
@@ -456,7 +510,7 @@ int lf_fileexist(struct lua_State *L)
 	if(!lua_isstring(L,1))
 		luaL_error(L, "fileexist: expected string");
 		
-	if(file_exist(lua_tostring(L,1)))
+	if(file_timestamp(lua_tostring(L,1)))
 		lua_pushnumber(L, 1);	
 	else
 		lua_pushnil(L);
@@ -742,22 +796,4 @@ int lf_table_tostring(struct lua_State *L)
 		free(buffer);
 	
 	return 1;
-}
-
-int lf_loadplugin(struct lua_State *L)
-{
-	PLUGINFUNC func;
-	if(lua_gettop(L) != 1)
-		luaL_error(L, "loadplugin: incorrect number of arguments");
-	luaL_checktype(L, 1, LUA_TSTRING);
-
-	func = plugin_load(lua_tostring(L, 1));
-	if(!func)
-		luaL_error(L, "loadplugin: error loading plugin");
-		
-	lua_settop(L, 0);
-	if((*func)(L) != 0)
-		luaL_error(L, "loadplugin: error initing plugin");
-	
-	return 0;
 }

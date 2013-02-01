@@ -2,12 +2,10 @@
 ScriptArgs = _bam_scriptargs
 IsString = bam_isstring
 IsTable = bam_istable
-MakeDirectory = bam_mkdir
 Exist = bam_fileexist
+NodeExist = bam_nodeexist
 SetFilter = bam_set_filter
-SetTouch = bam_set_touch
 AddOutput = bam_add_output
-LoadPlugin = bam_load_plugin
 
 --[[@GROUP Common @END]]--
 
@@ -335,6 +333,23 @@ CollectDirs = bam_collectdirs
 @END]]--
 CollectDirsRecursive = bam_collectdirsrecursive
 
+--[[@FUNCTION MakeDirectory(path)
+	Creates the requested directory.
+@END]]--
+MakeDirectory = bam_mkdir
+
+--[[@FUNCTION MakeDirectories(filename)
+	Creates the path upto the filename.
+
+	Example:
+	{{{{
+		MakeDirectories("output/directory/object.o")
+	}}}}
+
+	This will create the complete "output/directory" path.
+@END]]--
+MakeDirectories = bam_mkdirs
+
 --[[@GROUP Targets@END]]--
 
 --[[@FUNCTION DefaultTarget(filename)
@@ -371,8 +386,7 @@ end
 	[ModuleFilename] function.
 @END]]--
 function Import(filename)
-	local paths = {""}
-	local chunk = nil
+	local paths = {"", PathDir(ModuleFilename())}
 
 	s = os.getenv("BAM_PACKAGES")
 	if s then
@@ -383,15 +397,18 @@ function Import(filename)
 		end
 	end
 	
-	for k,v in pairs(paths) do
-		chunk = bam_loadfile(filename)
-		if chunk then
-			local current = _bam_modulefilename
-			_bam_modulefilename = filename
-			bam_update_globalstamp(_bam_modulefilename)
-			chunk()
-			_bam_modulefilename = current
-			return
+	for _,path in pairs(paths) do
+		local filepath = PathJoin(path, filename)
+		if Exist(filepath) then
+			local chunk = bam_loadfile(filepath)
+			if chunk then
+				local current = _bam_modulefilename
+				_bam_modulefilename = filepath
+				bam_update_globalstamp(_bam_modulefilename)
+				chunk()
+				_bam_modulefilename = current
+				return
+			end
 		end
 	end
 
@@ -464,6 +481,16 @@ function NewTable()
 	t.Merge = function(self, source)
 		for k,v in ipairs(source) do
 			table.insert(self, v)
+		end
+		self.version = self.version + 1
+	end
+	
+	t.Remove = function(self, val)
+		local tmp = {}
+		for k,v in ipairs(self) do
+			if v == val then
+				table.remove(self, k)
+			end
 		end
 		self.version = self.version + 1
 	end

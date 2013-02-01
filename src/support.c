@@ -103,32 +103,6 @@
 		Sleep(1);
 	}
 	
-	PLUGINFUNC plugin_load(const char *filename)
-	{
-		char buffer[MAX_PATH_LENGTH];
-		HMODULE handle;
-		FARPROC func;
-		
-		_snprintf(buffer, sizeof(buffer), "%s.dll", filename);
-
-		handle = LoadLibrary(buffer);
-		if(handle == NULL)
-		{
-			fprintf(stderr, "error loading plugin '%s'\n", buffer);
-			return NULL;
-		}
-		
-		func = GetProcAddress(handle, "plugin_main");
-		if(func == NULL)
-		{
-			CloseHandle(handle);
-			fprintf(stderr, "error fetching plugin main from '%s'\n", buffer);
-			return NULL;
-		}
-		
-		return (PLUGINFUNC)func;
-	}
-
 	int threads_corecount()
 	{
 		SYSTEM_INFO sysinfo;
@@ -136,6 +110,25 @@
 		if(sysinfo.dwNumberOfProcessors >= 1)
 			return sysinfo.dwNumberOfProcessors;
 		return 1;
+	}
+
+
+	int64 time_get()
+	{
+		static int64 last = 0;
+		int64 t;
+		QueryPerformanceCounter((PLARGE_INTEGER)&t);
+		if(t<last) /* for some reason, QPC can return values in the past */
+			return last;
+		last = t;
+		return t;
+	}
+
+	int64 time_freq()
+	{
+		int64 t;
+		QueryPerformanceFrequency((PLARGE_INTEGER)&t);
+		return t;
 	}
 
 #else
@@ -154,6 +147,9 @@
 	#include <sys/wait.h> 
 	#include <utime.h>
 	#include <pthread.h>
+	#include <signal.h>
+
+	#include <sys/time.h>
 
 #ifdef BAM_PLATFORM_MACOSX
 	#include <sys/param.h>
@@ -281,46 +277,17 @@
 	    return 1;
 #endif
 	}
-	
-	PLUGINFUNC plugin_load(const char *filename)
+
+	int64 time_get()
 	{
-		char buffer[MAX_PATH_LENGTH];
-		const char *error;
-		void *handle;
-		union
-		{
-			PLUGINFUNC func;
-			void *ptr;
-		} func;
-		
-		if(strlen(filename) > sizeof(buffer) - 10)
-			return (PLUGINFUNC)0;
-		
-		strcpy(buffer, "./");
-		strcat(buffer, filename);
-		strcpy(buffer, ".so");
+		struct timeval val;
+		gettimeofday(&val, NULL);
+		return (int64)val.tv_sec*(int64)1000000+(int64)val.tv_usec;
+	}
 
-		handle = dlopen(buffer, RTLD_LAZY);
-		if(!handle)
-		{
-			fputs(dlerror(), stderr);
-			fputs("\n", stderr);
-			
-			return NULL;
-		}
-		
-		func.ptr = dlsym(handle, "plugin_main");
-		error = dlerror();
-
-		if(error)
-		{
-			fputs(error, stderr);
-			fputs("\n", stderr);
-			dlclose(handle);
-			return NULL;
-		}
-		
-		return func.func;
+	int64 time_freq()
+	{
+		return 1000000;
 	}
 		
 #endif
@@ -361,7 +328,30 @@ int file_createdir(const char *path)
 void file_touch(const char *filename)
 {
 #ifdef BAM_FAMILY_WINDOWS
-	_utime(filename, NULL);
+	/*
+		_utime under windows seem to contain a bug that doesn't release the file handle in a timly fashion.
+		This implementation is basiclly the same but smaller and less cruft.
+	*/
+	HANDLE handle;
+	FILETIME ft;
+	SYSTEMTIME st;
+
+	handle = CreateFile(
+		filename,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+
+	if(handle != INVALID_HANDLE_VALUE)
+	{
+		GetSystemTime(&st);
+		SystemTimeToFileTime(&st, &ft);
+		SetFileTime(handle, (LPFILETIME)NULL, (LPFILETIME)NULL, &ft);
+		CloseHandle(handle);
+	}
 #else
 	utime(filename, NULL);
 #endif
@@ -381,6 +371,12 @@ static void passthru(FILE *fp)
 		criticalsection_leave();
 	}
 }
+#endif
+
+#ifdef BAM_FAMILY_WINDOWS
+/* forward declaration */
+FILE *_popen(const char *, const char *);
+int _pclose(FILE *);
 #endif
 
 int run_command(const char *cmd, const char *filter)
@@ -497,12 +493,57 @@ int run_command(const char *cmd, const char *filter)
 	return ret;
 }
 
-/* general */
-int file_exist(const char *filename)
+/* like file_createdir, but automatically creates all top-level directories needed
+	If you feed it "output/somefiles/output.o" it will create "output/somefiles"
+*/	
+int file_createpath(const char *output_name)
 {
-	struct stat s;
-	if(stat(filename, &s) == 0)
-		return 1;
+	char buffer[MAX_PATH_LENGTH];
+	int i;
+	char t;
+	
+	/* fish out the directory */
+	if(path_directory(output_name, buffer, sizeof(buffer)) != 0)
+	{
+		fprintf(stderr, "path error: %s\n", buffer);
+		return -1;
+	}
+	
+	/* no directory in path */
+	if(buffer[0] == 0)
+		return 0;
+	
+	/* check if we need to do a deep walk */
+	if(file_createdir(buffer) == 0)
+		return 0;
+	
+	/* create dir by doing a deep walk */
+	i = 0;
+	while(1)
+	{
+		if((buffer[i] == '/') || (buffer[i] == 0))
+		{
+			/* insert null terminator */
+			t = buffer[i];
+			buffer[i] = 0;
+			
+			if(file_createdir(buffer) != 0)
+			{
+				fprintf(stderr, "path error2: %s\n", buffer);
+				return -1;
+			}
+			
+			/* restore the path */
+			buffer[i] = t;
+		}
+		
+		if(buffer[i] == 0)
+			break;
+		
+		i++;
+	}
+	
+	/* return success */
 	return 0;
 }
 
@@ -741,4 +782,39 @@ void string_hash_tostr(hash_t value, char *output)
 {
 	sprintf(output, "%08x%08x", (unsigned)(value>>32), (unsigned)(value&0xffffffff));
 }
+
+
+static int64 starttime = 0;
+
+static void event_log(int thread, const char *type, const char *name, const char *data)
+{
+	double t;
+	if(session.eventlog == NULL)
+		return;
+
+	if(starttime == 0)
+		starttime = time_get();
+
+	if(data == NULL)
+		data = "";
+
+	t = (time_get() - starttime) / (double)time_freq();
+	fprintf(session.eventlog, "%d %f %s %s: %s\n", thread, t, type, name, data);
+
+	if(session.eventlogflush)
+		fflush(session.eventlog);
+}
+
+void event_begin(int thread, const char *name, const char *data)
+{
+	event_log(thread, "begin", name, data);
+}
+
+void event_end(int thread, const char *name, const char *data)
+{
+	event_log(thread, "end", name, data);
+}
+
+
+
 
